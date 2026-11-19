@@ -118,6 +118,31 @@ fn render(v: &View, threads: usize, row: RowFn) -> Vec<u32> {
     buf
 }
 
+type Scheduler = fn(&View, usize, RowFn) -> Vec<u32>;
+
+/// Static contiguous bands, one per thread, rows split as evenly as possible: the baseline `render`'s row counter is compared against.
+fn render_bands(v: &View, threads: usize, row: RowFn) -> Vec<u32> {
+    let mut buf = vec![0u32; v.width * v.height];
+    let threads = threads.min(v.height);
+    let (base, extra) = (v.height / threads, v.height % threads);
+    std::thread::scope(|s| {
+        let mut rest = buf.as_mut_slice();
+        let mut y0 = 0;
+        for b in 0..threads {
+            let rows = base + usize::from(b < extra);
+            let (band, tail) = rest.split_at_mut(rows * v.width);
+            rest = tail;
+            s.spawn(move || {
+                for (i, out) in band.chunks_mut(v.width).enumerate() {
+                    row(v, y0 + i, out);
+                }
+            });
+            y0 += rows;
+        }
+    });
+    buf
+}
+
 fn color(n: u32, max_iter: u32) -> [u8; 3] {
     if n >= max_iter {
         return [0, 0, 0];
@@ -146,6 +171,7 @@ struct Args {
     max_iter: u32,
     threads: usize,
     simd: bool,
+    schedule: Scheduler,
     out: String,
 }
 
@@ -160,6 +186,7 @@ fn parse_args() -> Result<Args, String> {
         max_iter: 1000,
         threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
         simd: true,
+        schedule: render,
         out: "mandelbrot.ppm".into(),
     };
     let mut it = std::env::args().skip(1);
@@ -188,6 +215,13 @@ fn parse_args() -> Result<Args, String> {
             "--iter" => a.max_iter = num(&arg, &val)?,
             "--threads" => a.threads = num(&arg, &val)?,
             "--out" => a.out = val,
+            "--schedule" => {
+                a.schedule = match val.as_str() {
+                    "rows" => render as Scheduler,
+                    "bands" => render_bands,
+                    _ => return Err(format!("bad value for --schedule: {val}; use rows or bands")),
+                }
+            }
             _ => return Err(format!("unknown flag {arg}")),
         }
     }
@@ -203,22 +237,24 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
-fn timed(v: &View, threads: usize, row: RowFn) -> (Vec<u32>, f64) {
+fn timed(v: &View, threads: usize, row: RowFn, schedule: Scheduler) -> (Vec<u32>, f64) {
     let t = Instant::now();
-    let buf = render(v, threads, row);
+    let buf = schedule(v, threads, row);
     (buf, t.elapsed().as_secs_f64())
 }
 
 fn main() {
     let a = parse_args().unwrap_or_else(|e| {
-        eprintln!("error: {e}\nusage: mandelbrot-neon [render|bench] [--cx F --cy F --zoom F --width N --height N --iter N --threads N --scalar --out FILE]");
+        eprintln!("error: {e}\nusage: mandelbrot-neon [render|bench] [--cx F --cy F --zoom F --width N --height N --iter N --threads N --schedule rows|bands --scalar --out FILE]");
         std::process::exit(2);
     });
     let v = View::new(a.cx, a.cy, a.zoom, a.width, a.height, a.max_iter);
 
     if a.mode == "render" {
         let row: RowFn = if a.simd { neon_row } else { scalar_row };
-        let (counts, secs) = timed(&v, a.threads, row);
+        let t = Instant::now();
+        let counts = (a.schedule)(&v, a.threads, row);
+        let secs = t.elapsed().as_secs_f64();
         write_ppm(&a.out, &v, &counts).expect("write failed");
         println!("wrote {} ({}x{}) in {:.3}s", a.out, v.width, v.height, secs);
         return;
@@ -236,9 +272,9 @@ fn main() {
     println!("{}x{}, max_iter {}, {} threads, median of {RUNS} runs", v.width, v.height, v.max_iter, a.threads);
     println!("{:<22} {:>9} {:>14} {:>9}", "config", "seconds", "Giter/s", "speedup");
     for (i, (name, threads, row)) in configs.iter().enumerate() {
-        let (buf, _) = timed(&v, *threads, *row); // warm-up, also the output compared below
+        let (buf, _) = timed(&v, *threads, *row, a.schedule); // warm-up, also the output compared below
         let total: u64 = buf.iter().map(|&n| n as u64).sum();
-        let mut times: Vec<f64> = (0..RUNS).map(|_| timed(&v, *threads, *row).1).collect();
+        let mut times: Vec<f64> = (0..RUNS).map(|_| timed(&v, *threads, *row, a.schedule).1).collect();
         times.sort_by(f64::total_cmp);
         let secs = times[RUNS / 2];
         if i == 0 {
@@ -276,5 +312,16 @@ mod tests {
         assert_eq!(scalar_pixel(0.0, 0.0, 100), 100); // inside the set
         assert_eq!(scalar_pixel(2.0, 2.0, 100), 1); // |z1|^2 = 8 escapes at the second check
         assert_eq!(scalar_pixel(-1.0, 0.0, 100), 100); // 0 -> -1 -> 0 -> -1: a bounded 2-cycle
+    }
+
+    // More threads than rows: bands must still cover every row exactly once and match the scalar reference.
+    #[test]
+    fn schedules_agree() {
+        for (w, h, threads) in [(97, 53, 1), (97, 53, 3), (64, 5, 16), (64, 9, 4)] {
+            let v = View::new(-0.5, 0.3, 1.0, w, h, 300); // off the real axis: the set is symmetric about cy=0, so a flipped row order would pass there
+            let want = render(&v, 1, scalar_row);
+            assert_eq!(want, render_bands(&v, threads, neon_row));
+            assert_eq!(want, render(&v, threads, neon_row));
+        }
     }
 }

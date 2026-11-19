@@ -14,7 +14,7 @@ cargo run --release -- bench
 cargo test --release
 ```
 
-Flags: `--cx --cy --zoom --width --height --iter --threads --scalar --out`. Output is a PPM file (`sips -s format png in.ppm --out out.png` converts it on macOS).
+Flags: `--cx --cy --zoom --width --height --iter --threads --schedule rows|bands --scalar --out`. Output is a PPM file (`sips -s format png in.ppm --out out.png` converts it on macOS).
 
 ## Results
 
@@ -46,14 +46,29 @@ NEON, full HD image, `max_iter` 1000, best of 3 runs per thread count, same busy
 | 10 | 0.164 | 6.67x |
 | 12 | 0.163 | 6.71x |
 
-Scaling is near linear up to 6 threads (95% efficiency) and flat after 8. The M1 Pro has 6 performance and 2 efficiency cores, and threads 7 and 8 add only about 1.0x together, so an efficiency core does roughly half the work of a performance core. That fits the 8-thread ceiling of about 7x, and 6.71x is 96% of the 6 + 2 x 0.5 = 7.0 that this predicts. This is a fit to the same data, not an independent measurement; I tried to time one thread on an efficiency core with `taskpolicy -b`, but that also lowers the clock (3.4x slower) so I did not use it. Row hand-out through the shared iterator is not the bottleneck: it would have shown up as sub-linear scaling below 6 threads.
+Scaling is near linear up to 6 threads (95% efficiency) and flat after 8. The M1 Pro has 6 performance and 2 efficiency cores, and threads 7 and 8 add only about 1.0x together, so an efficiency core does roughly half the work of a performance core. That fits the 8-thread ceiling of about 7x, and 6.71x is 96% of the 6 + 2 x 0.5 = 7.0 that this predicts. This is a fit to the same data, not an independent measurement; I tried to time one thread on an efficiency core with `taskpolicy -b`, but that also lowers the clock (3.4x slower) so I did not use it. Row hand-out is unlikely to be the bottleneck: contention would show as sub-linear scaling below 6 threads, and scaling is near linear there.
+
+## Scheduling
+
+`--schedule rows` (default) hands out one row at a time from a shared counter. `--schedule bands` splits the image into one contiguous block of rows per thread. Both produce identical output, checked with `cmp`. Timed on NEON, full HD, `max_iter` 1000, default view, best of 3 runs, rows and bands alternated per thread count:
+
+| Threads | Rows (s) | Bands (s) |
+|---|---|---|
+| 1 | 1.102 | 1.099 |
+| 2 | 0.563 | 0.610 |
+| 4 | 0.285 | 0.422 |
+| 6 | 0.219 | 0.315 |
+| 8 | 0.178 | 0.260 |
+| 12 | 0.182 | 0.225 |
+
+Rows win at every thread count above 1; at 8 threads bands are about 46% slower. On a seahorse view (zoom 400, `max_iter` 3000, 8 threads) rows took 0.063 s and bands 0.116 s, but that render is under a tenth of a second, so treat it as noise-prone. The load average rose from 3.8 to 6.0 during these runs. This is one machine and one symmetric view, so it does not show a case where the cost is more skewed. I did not try work-stealing.
 
 ## How it works
 
 - Each pixel iterates `z = z^2 + c` until `|z|^2 >= 4` or `max_iter`.
 - The NEON loop keeps a sticky active mask per lane. A lane that escapes stops counting while its neighbour keeps going, and the loop exits when both lanes are done.
 - Both loops use separate multiply and add, never fused multiply-add. That keeps rounding identical, which is why the iteration counts match exactly.
-- Threads take one row at a time from a shared iterator. Rows near the set cost far more than rows far from it, so fixed bands would leave threads idle.
+- Threads take one row at a time from a shared counter. In the default view, fixed bands were slower at every thread count above 1 (see Scheduling), so the counter stays. I did not try work-stealing.
 - Multi-threaded speedup stops at about 6.7x on 8 cores. The data fits two slower efficiency cores (see Thread scaling), but I did not isolate that as the cause.
 
 ## Limits
