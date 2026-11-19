@@ -191,8 +191,11 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(format!("unknown flag {arg}")),
         }
     }
-    if a.width == 0 || a.height == 0 || a.threads == 0 || a.max_iter == 0 || a.zoom <= 0.0 {
-        return Err("width, height, threads, iter and zoom must be positive".into());
+    if !(a.cx.is_finite() && a.cy.is_finite() && a.zoom.is_finite() && a.zoom > 0.0) {
+        return Err("cx and cy must be finite and zoom must be finite and positive".into());
+    }
+    if a.width == 0 || a.height == 0 || a.threads == 0 || a.max_iter == 0 {
+        return Err("width, height, threads and iter must be positive".into());
     }
     if a.mode != "render" && a.mode != "bench" {
         return Err(format!("unknown mode {}; use render or bench", a.mode));
