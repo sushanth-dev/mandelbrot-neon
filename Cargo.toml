@@ -1,0 +1,9 @@
+[package]
+name = "mandelbrot-neon"
+version = "0.1.0"
+edition = "2024"
+description = "Mandelbrot renderer with a hand-vectorized NEON inner loop, checked pixel for pixel against a scalar loop"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]

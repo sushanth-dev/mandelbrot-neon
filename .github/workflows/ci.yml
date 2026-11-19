@@ -1,0 +1,13 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: macos-14 # Apple silicon (aarch64), required by the NEON code
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo test --release
+      - run: cargo run --release -- bench --width 640 --height 360
